@@ -2,16 +2,10 @@
 Bank Transaction Fraud Detection Pipeline
 ==========================================
 Ingests banking transaction data, engineers fraud-detection
-features, scores each transaction's fraud probability, flags
-suspicious activity, and saves results for compliance reporting.
+features, scores each transaction, flags suspicious activity,
+and loads into PostgreSQL for compliance reporting.
 
 Targets: Absa Bank Ghana
-
-Pipeline Flow:
-    Extract  -> raw bank transaction records (synthetic)
-    Transform -> multi-layer fraud feature engineering + scoring
-    Load     -> PostgreSQL or CSV fallback
-    Report   -> fraud summary by channel, region, risk tier
 
 Author: Lawrence Koomson
 GitHub: github.com/lawrykoomson
@@ -30,9 +24,6 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# ─────────────────────────────────────────────
-#  LOGGING
-# ─────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -43,9 +34,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ─────────────────────────────────────────────
-#  CONFIG
-# ─────────────────────────────────────────────
 DB_CONFIG = {
     "host":     os.getenv("DB_HOST", "localhost"),
     "port":     int(os.getenv("DB_PORT", 5432)),
@@ -56,26 +44,17 @@ DB_CONFIG = {
 
 PROCESSED_PATH = Path("data/processed/")
 
-CHANNELS = ["ATM", "Online Banking", "Mobile App", "Branch Teller", "POS Terminal"]
-TRANSACTION_TYPES = ["Transfer", "Withdrawal", "Purchase", "Bill Payment",
-                     "Loan Repayment", "Deposit"]
-REGIONS = ["Greater Accra", "Ashanti", "Western", "Eastern", "Northern"]
+CHANNELS          = ["ATM", "Online Banking", "Mobile App", "Branch Teller", "POS Terminal"]
+TRANSACTION_TYPES = ["Transfer", "Withdrawal", "Purchase", "Bill Payment", "Loan Repayment", "Deposit"]
+REGIONS           = ["Greater Accra", "Ashanti", "Western", "Eastern", "Northern"]
 
-# Fraud detection thresholds
-HIGH_AMOUNT_THRESHOLD    = 5000   # GHS
-RAPID_TXN_WINDOW_MINS   = 5      # minutes
-UNUSUAL_HOUR_START      = 0      # midnight
-UNUSUAL_HOUR_END        = 5      # 5am
+HIGH_AMOUNT_THRESHOLD  = 5000
+RAPID_TXN_WINDOW_MINS  = 5
+UNUSUAL_HOUR_START     = 0
+UNUSUAL_HOUR_END       = 5
 
 
-# ─────────────────────────────────────────────
-#  EXTRACT
-# ─────────────────────────────────────────────
 def extract() -> pd.DataFrame:
-    """
-    Generate 20,000 synthetic bank transactions with injected fraud.
-    In production: connects to core banking system or data lake.
-    """
     logger.info("[EXTRACT] Generating synthetic bank transaction data...")
     np.random.seed(7)
     n = 20000
@@ -87,14 +66,12 @@ def extract() -> pd.DataFrame:
         for m in np.random.randint(0, 525600, n)
     ]
 
-    # Realistic amount distribution — mostly small, some large
     amounts = np.where(
         np.random.rand(n) < 0.05,
-        np.random.uniform(5000, 50000, n),   # 5% large/suspicious
-        np.abs(np.random.lognormal(5, 1.2, n))  # 95% normal
+        np.random.uniform(5000, 50000, n),
+        np.abs(np.random.lognormal(5, 1.2, n))
     ).round(2)
 
-    # Inject 3% true fraud
     is_fraud = np.zeros(n, dtype=int)
     fraud_idx = np.random.choice(n, int(n * 0.03), replace=False)
     is_fraud[fraud_idx] = 1
@@ -122,42 +99,28 @@ def extract() -> pd.DataFrame:
         "is_fraud_actual":  is_fraud,
     })
 
-    logger.info(f"[EXTRACT] Generated {len(df):,} transactions "
-                f"({is_fraud.sum()} actual fraud injected).")
+    logger.info(f"[EXTRACT] Generated {len(df):,} transactions ({is_fraud.sum()} fraud injected).")
     return df
 
 
-# ─────────────────────────────────────────────
-#  TRANSFORM — FRAUD FEATURE ENGINEERING
-# ─────────────────────────────────────────────
 def transform(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Engineer 6 fraud detection signals and compute a composite
-    fraud risk score for every transaction.
-    """
     logger.info("[TRANSFORM] Engineering fraud detection features...")
 
     df = df.sort_values(["sender_account", "timestamp"]).reset_index(drop=True)
 
-    # ── Time features
     df["txn_hour"]        = df["timestamp"].dt.hour
     df["txn_date"]        = df["timestamp"].dt.date
     df["txn_day_of_week"] = df["timestamp"].dt.day_name()
     df["is_weekend"]      = df["timestamp"].dt.dayofweek >= 5
-    df["is_unusual_hour"] = df["txn_hour"].between(
-        UNUSUAL_HOUR_START, UNUSUAL_HOUR_END
-    )
+    df["is_unusual_hour"] = df["txn_hour"].between(UNUSUAL_HOUR_START, UNUSUAL_HOUR_END)
 
-    # ── Signal 1: High amount flag
-    df["is_high_amount"] = df["amount_ghs"] >= HIGH_AMOUNT_THRESHOLD
+    df["is_high_amount"]  = df["amount_ghs"] >= HIGH_AMOUNT_THRESHOLD
 
-    # ── Signal 2: Statistical amount outlier (z-score > 3 vs account history)
     acct_mean = df.groupby("sender_account")["amount_ghs"].transform("mean")
     acct_std  = df.groupby("sender_account")["amount_ghs"].transform("std").fillna(1)
     df["amount_z_score"]    = ((df["amount_ghs"] - acct_mean) / acct_std).round(3)
     df["is_amount_outlier"] = df["amount_z_score"] > 3.0
 
-    # ── Signal 3: Rapid succession (same sender within 5 mins)
     df["prev_timestamp"] = df.groupby("sender_account")["timestamp"].shift(1)
     df["mins_since_last_txn"] = (
         (df["timestamp"] - df["prev_timestamp"]).dt.total_seconds() / 60
@@ -165,18 +128,13 @@ def transform(df: pd.DataFrame) -> pd.DataFrame:
     df["is_rapid_txn"] = df["mins_since_last_txn"] < RAPID_TXN_WINDOW_MINS
     df = df.drop(columns=["prev_timestamp"])
 
-    # ── Signal 4: High daily frequency (>10 transactions in one day)
-    daily_count          = df.groupby(["sender_account","txn_date"])["transaction_id"].transform("count")
-    df["daily_txn_count"]    = daily_count
-    df["is_high_frequency"]  = df["daily_txn_count"] > 10
+    daily_count           = df.groupby(["sender_account","txn_date"])["transaction_id"].transform("count")
+    df["daily_txn_count"] = daily_count
+    df["is_high_frequency"] = df["daily_txn_count"] > 10
 
-    # ── Signal 5: Foreign IP
-    df["is_foreign_ip"] = df["ip_country"] != "GH"
-
-    # ── Signal 6: Self transfer
+    df["is_foreign_ip"]    = df["ip_country"] != "GH"
     df["is_self_transfer"] = df["sender_account"] == df["receiver_account"]
 
-    # ── Composite fraud risk score (0-100)
     df["fraud_risk_score"] = (
         df["is_high_amount"].astype(int)    * 20 +
         df["is_rapid_txn"].astype(int)      * 20 +
@@ -186,17 +144,14 @@ def transform(df: pd.DataFrame) -> pd.DataFrame:
         df["is_high_frequency"].astype(int) * 10
     ).clip(0, 100)
 
-    # ── Risk tier
     df["fraud_risk_tier"] = pd.cut(
         df["fraud_risk_score"],
         bins=[-1, 20, 45, 70, 100],
         labels=["Low", "Medium", "High", "Critical"]
     ).astype(str)
 
-    # ── Flag for compliance review
     df["requires_review"] = df["fraud_risk_tier"].isin(["High", "Critical"])
 
-    # ── Human-readable alert reason
     def build_alert(row):
         reasons = []
         if row["is_high_amount"]:
@@ -216,20 +171,13 @@ def transform(df: pd.DataFrame) -> pd.DataFrame:
     df["alert_reason"] = df.apply(build_alert, axis=1)
     df["processed_at"] = datetime.now()
 
-    flagged   = df["requires_review"].sum()
-    critical  = (df["fraud_risk_tier"] == "Critical").sum()
+    flagged  = df["requires_review"].sum()
+    critical = (df["fraud_risk_tier"] == "Critical").sum()
     logger.info(f"[TRANSFORM] Complete. Flagged: {flagged:,} | Critical: {critical:,}")
     return df
 
 
-# ─────────────────────────────────────────────
-#  LOAD
-# ─────────────────────────────────────────────
 def load(df: pd.DataFrame):
-    """
-    Load fraud-scored transactions into PostgreSQL.
-    Falls back to CSV if database is unavailable.
-    """
     logger.info("[LOAD] Attempting PostgreSQL connection...")
     try:
         conn = psycopg2.connect(**DB_CONFIG)
@@ -311,7 +259,6 @@ def load(df: pd.DataFrame):
                 records, page_size=500
             )
 
-            # Load high-risk alerts separately
             alerts_df = df[df["requires_review"]][[
                 "transaction_id","fraud_risk_tier","fraud_risk_score",
                 "alert_reason","amount_ghs","channel","region"
@@ -327,7 +274,7 @@ def load(df: pd.DataFrame):
             conn.commit()
 
         conn.close()
-        logger.info(f"[LOAD] Loaded {len(df):,} transactions + {len(alerts_df):,} alerts into PostgreSQL.")
+        logger.info(f"[LOAD] Successfully loaded {len(df):,} transactions + {len(alerts_df):,} alerts into PostgreSQL.")
 
     except Exception as e:
         logger.warning(f"[LOAD] PostgreSQL unavailable ({e})")
@@ -337,9 +284,6 @@ def load(df: pd.DataFrame):
         logger.info(f"[LOAD] Saved to {fallback}")
 
 
-# ─────────────────────────────────────────────
-#  SUMMARY REPORT
-# ─────────────────────────────────────────────
 def print_summary(df: pd.DataFrame):
     flagged       = df["requires_review"].sum()
     critical      = (df["fraud_risk_tier"] == "Critical").sum()
@@ -378,35 +322,18 @@ def print_summary(df: pd.DataFrame):
     )
     for region, val in region_risk.items():
         print(f"    {region:<20} : GHS {val:,.2f}")
-    print("-"*68)
-    print("  TOP FRAUD SIGNALS TRIGGERED:")
-    signals = {
-        "High Amount"      : df["is_high_amount"].sum(),
-        "Rapid Succession" : df["is_rapid_txn"].sum(),
-        "Amount Outlier"   : df["is_amount_outlier"].sum(),
-        "Unusual Hour"     : df["is_unusual_hour"].sum(),
-        "Foreign IP"       : df["is_foreign_ip"].sum(),
-        "High Frequency"   : df["is_high_frequency"].sum(),
-    }
-    for signal, count in sorted(signals.items(), key=lambda x: x[1], reverse=True):
-        print(f"    {signal:<20} : {count:,} transactions")
     print("="*68 + "\n")
 
 
-# ─────────────────────────────────────────────
-#  MAIN
-# ─────────────────────────────────────────────
 def run_pipeline():
     logger.info("=" * 62)
     logger.info("  BANK FRAUD DETECTION PIPELINE — STARTED")
     logger.info("=" * 62)
     start = datetime.now()
-
     df = extract()
     df = transform(df)
     load(df)
     print_summary(df)
-
     duration = (datetime.now() - start).total_seconds()
     logger.info(f"PIPELINE COMPLETED in {duration:.2f} seconds")
 

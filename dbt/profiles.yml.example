@@ -1,0 +1,13 @@
+fraud_analytics:
+  target: dev
+  outputs:
+    dev:
+      type: postgres
+      host: localhost
+      port: 5432
+      user: postgres
+      password: "your_postgres_password_here"
+      dbname: bank_analytics
+      schema: fraud_detection
+      threads: 4
+      connect_timeout: 10

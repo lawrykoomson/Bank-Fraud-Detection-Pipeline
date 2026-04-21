@@ -1,0 +1,27 @@
+version: 2
+
+sources:
+  - name: fraud_detection
+    database: bank_analytics
+    schema: fraud_detection
+    tables:
+      - name: fact_transactions
+        description: "Raw fraud-scored bank transactions loaded by ETL pipeline"
+
+models:
+  - name: stg_fraud_transactions
+    description: "Staged and enriched fraud transaction data"
+    columns:
+      - name: transaction_id
+        description: "Unique transaction identifier"
+        tests:
+          - unique
+          - not_null
+      - name: transaction_amount_ghs
+        description: "Transaction amount in GHS"
+        tests:
+          - not_null
+      - name: fraud_risk_score
+        description: "Fraud risk score 0-100"
+        tests:
+          - not_null
